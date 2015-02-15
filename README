@@ -1,0 +1,14 @@
+perf2pprof converts perf record output to gperftools CPU profile
+format for analysis and visualization using excellent pprof tool.
+
+Example:
+---------
+
+# perf record --call-graph dwarf ./slow-words-count </usr/share/dic/words
+
+# perf2pprof --web
+
+(or)
+
+# perf2pprof --output slow-words-count.prof
+# pprof --gv ./slow-words-count slow-words-count.prof

@@ -1,0 +1,125 @@
+#!/usr/bin/ruby
+
+require 'set'
+require 'optparse'
+require 'ostruct'
+require 'tempfile'
+require 'shellwords'
+
+MMAPRE = /PERF_RECORD_MMAP2.*?\[(.*?)\((.*)\) @ (\S+).*\]:\s+(\S+)\s+(.+)/
+STACKRE = /\A\s+([0-9A-Fa-f]+)/
+
+class Converter
+  attr_reader :first_map
+
+  def read(inp)
+    maps = Set.new
+    first_map = nil
+
+    all_stacks = []
+
+    inp.each_line do |line|
+      while true
+        line.chomp!
+        if line =~ /\A\S/
+          if line =~ MMAPRE
+            addr, size, off, rxp, rest = $1.to_i(0), $2.to_i(0), $3.to_i(0), $4, $5
+            m = [addr, size, off, rxp, rest]
+            first_map = m unless first_map
+            maps << m
+          end
+        elsif line !~ /^$/
+          raise "unexpected: #{line}" unless line =~ STACKRE
+          stack = [$1.to_i(16)+1]
+          while (line = inp.gets)
+            break unless line =~ STACKRE
+            stack << $1.to_i(16)
+          end
+          all_stacks << stack
+          next if line
+        end
+        break
+      end
+    end
+    @all_stacks = all_stacks
+    @maps = maps
+    @first_map = first_map
+    self
+  end
+
+  def self.read(inp)
+    self.new.read(inp)
+  end
+
+  def write(outp)
+    procmaps = ""
+    @maps.to_a.sort.each do |(addr, size, off, rxp, rest)|
+      procmaps << "#{addr.to_s(16)}-#{(addr+size).to_s(16)} #{rxp} #{off.to_s(16)} 00:00 0  #{rest}\n"
+    end
+
+    # this is 64-bit cpu-profile header for pprof
+    hdr = %w[0x00000 0x00000 0x00003 0x00000
+           0x00000 0x00000 0x02710 0x00000
+           0x00000 0x00000].map {|s| s.to_i(0)}.pack("L<*")
+
+    outp.print hdr
+
+    @all_stacks.each do |stack|
+      s = stack.size
+      newstack = [1, s, *stack]
+      outp.print(newstack.pack("Q<*"))
+    end
+
+    outp.print([0, 1, 0].pack("Q<*"))
+
+    outp.print procmaps
+  end
+
+end
+
+def parse_options!
+  opts = OpenStruct.new
+  opts.perf_template = "perf script -i %s --show-mmap-events"
+  opts.web = false
+  opts.perf_data = "perf.data"
+  opts.opath = nil
+
+  OptionParser.new do |op|
+    op.on("-p", "--perf-template STRING",
+          "perf invokation template (#{opts.pprof_template})") do |val|
+      opts.perf_template = val
+    end
+    op.on("--web") do
+      opts.web = true
+    end
+    op.on("-i", "--input PATH", "override input file to perf (perf.data)") do |path|
+      opts.perf_data = path
+    end
+    op.on("-o", "--output PATH", "pprof cpu profile to output") do |path|
+      opts.opath = path
+    end
+  end.parse!(ARGV)
+  opts
+end
+
+opts = parse_options!
+
+if (opts.web && opts.opath) || (!opts.web && !opts.opath)
+  puts "exactly one of --web and --output must be given"
+  Process.exit(1)
+end
+
+c = IO.popen(opts.perf_template % [Shellwords.escape(opts.perf_data)], "r") do |f|
+  Converter.read f
+end
+
+if opts.web
+  temp = Tempfile.new("pprof-conv")
+  c.write(temp)
+  temp.close
+  pprof = ENV["PPROF_PATH"] || "pprof"
+  args = [pprof, "--web", c.first_map.last, temp.path]
+  p system(*args)
+else
+  c.write(File.open(opts.opath, "w"))
+end
